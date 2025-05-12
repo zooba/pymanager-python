@@ -13,6 +13,21 @@ static HINSTANCE hModule;
 #define CLSID_IDLE_COMMAND "{C7E29CB0-9691-4DE8-B72B-6719DDC0B4A1}"
 #define CLSID_LAUNCH_COMMAND "{F7209EE3-FC96-40F4-8C3F-4B7D3994370D}"
 #define CLSID_COMMAND_ENUMERATOR "{F82C8CD5-A69C-45CC-ADC6-87FC5F4A7429}"
+#define CLSID_PYTHON_DROP_TARGET "{576E91FB-BDF5-4E9C-9DE3-B4E9997F25FC}"
+
+
+static HRESULT CoTaskCopyWstr(LPWSTR *dest, const std::wstring &src)
+{
+    if (!dest) {
+        return E_POINTER;
+    }
+    *dest = (LPWSTR)CoTaskMemAlloc((src.size() + 1) * sizeof(WCHAR));
+    if (!*dest) {
+        return E_OUTOFMEMORY;
+    }
+    wcsncpy_s(*dest, src.size() + 1, src.data(), src.size());
+    return S_OK;
+}
 
 
 LRESULT RegReadStr(HKEY key, LPCWSTR valueName, std::wstring& result)
@@ -179,9 +194,7 @@ public:
     // IExplorerCommand
     IFACEMETHODIMP GetTitle(IShellItemArray *psiItemArray, LPWSTR *ppszName)
     {
-        *ppszName = (LPWSTR)CoTaskMemAlloc((title.size() + 1) * sizeof(WCHAR));
-        wcscpy_s(*ppszName, title.size() + 1, title.data());
-        return S_OK;
+        return CoTaskCopyWstr(ppszName, title);
     }
 
     IFACEMETHODIMP GetIcon(IShellItemArray *psiItemArray, LPWSTR *ppszIcon)
@@ -398,17 +411,13 @@ public:
     // IExplorerCommand
     IFACEMETHODIMP GetTitle(IShellItemArray *psiItemArray, LPWSTR *ppszName)
     {
-        *ppszName = (LPWSTR)CoTaskMemAlloc((title.size() + 1) * sizeof(WCHAR));
-        wcscpy_s(*ppszName, title.size() + 1, title.c_str());
-        return S_OK;
+        return CoTaskCopyWstr(ppszName, title);
     }
 
     IFACEMETHODIMP GetIcon(IShellItemArray *psiItemArray, LPWSTR *ppszIcon)
     {
         if (!iconPath.empty()) {
-            *ppszIcon = (LPWSTR)CoTaskMemAlloc((iconPath.size() + 1) * sizeof(WCHAR));
-            wcscpy_s(*ppszIcon, iconPath.size() + 1, iconPath.c_str());
-            return S_OK;
+            return CoTaskCopyWstr(ppszIcon, iconPath);
         } else {
             *ppszIcon = NULL;
             return E_NOTIMPL;
@@ -475,7 +484,207 @@ public:
 };
 
 
+class DECLSPEC_UUID(CLSID_PYTHON_DROP_TARGET) PythonDropTarget
+    : public RuntimeClass<RuntimeClassFlags<ClassicCom>, IDropTarget, IObjectWithSite>
+{
+
+    std::wstring _scriptName;
+    std::wstring _scriptDirectory;
+    std::wstring _scriptPath;
+
+public:
+    // IDropTarget
+    STDMETHODIMP DragEnter(IDataObject *pDataObj, DWORD grfKeyState, POINTL pt, DWORD *pdwEffect)
+    {
+        if (_scriptName.empty()) {
+            *pdwEffect = DROPEFFECT_NONE;
+            return S_OK;
+        }
+
+        *pdwEffect = DROPEFFECT_MOVE;
+
+        HRESULT hr;
+        static CLIPFORMAT cfDropDescription = RegisterClipboardFormat(CFSTR_DROPDESCRIPTION);
+        static CLIPFORMAT cfDragWindow = RegisterClipboardFormat(L"DragWindow");
+        static FORMATETC fmt1 = {cfDropDescription, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        static FORMATETC fmt2 = {cfDragWindow, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        STGMEDIUM medium;
+        DROPDESCRIPTION *dd;
+        HWND *pHWnd;
+
+        hr = pDataObj->GetData(&fmt1, &medium);
+        if (SUCCEEDED(hr)) {
+            if (dd = (DROPDESCRIPTION*)GlobalLock(medium.hGlobal)) {
+                wcscpy_s(dd->szMessage, L"Open with %1");
+                wcscpy_s(dd->szInsert, _scriptName.c_str());
+                dd->type = DROPIMAGE_MOVE;
+                GlobalUnlock(medium.hGlobal);
+            }
+            ReleaseStgMedium(&medium);
+        } else {
+            OutputDebugStringW(L"PyShellExt::DragEnter - failed to update drop description");
+            return hr;
+        }
+
+        hr = pDataObj->GetData(&fmt2, &medium);
+        if (SUCCEEDED(hr)) {
+            if ((pHWnd = (HWND*)GlobalLock(medium.hGlobal)) != NULL) {
+                // #define DDWM_UPDATEWINDOW (WM_USER+3)
+                SendMessage(*pHWnd, (WM_USER+3), 0, NULL);
+                GlobalUnlock(medium.hGlobal);
+            }
+            ReleaseStgMedium(&medium);
+        } else {
+            OutputDebugStringW(L"PyShellExt::DragEnter - failed to notify drag window");
+            return hr;
+        }
+
+        return S_OK;
+    }
+
+    STDMETHODIMP DragLeave()
+    {
+        return S_OK;
+    }
+
+    STDMETHODIMP DragOver(DWORD grfKeyState, POINTL pt, DWORD *pdwEffect)
+    {
+        return S_OK;
+    }
+
+    STDMETHODIMP Drop(IDataObject *pDataObj, DWORD grfKeyState, POINTL pt, DWORD *pdwEffect)
+    {
+        HRESULT hr;
+        std::vector<std::wstring> files;
+        std::wstring args;
+        FORMATETC fmt = {CF_HDROP, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        STGMEDIUM medium;
+        DROPFILES *pDropFiles = NULL;
+
+        hr = pDataObj->GetData(&fmt, &medium);
+        if (SUCCEEDED(hr)) {
+            pDropFiles = (DROPFILES*)GlobalLock(medium.hGlobal);
+        }
+        if (!pDropFiles) {
+            OutputDebugString(L"PyShellExt::GetArguments - failed to lock CF_HDROP hGlobal");
+            ReleaseStgMedium(&medium);
+            return E_FAIL;
+        }
+
+        if (pDropFiles->fWide) {
+            LPCWSTR name = (LPCWSTR)((char*)pDropFiles + pDropFiles->pFiles);
+            while (*name) {
+                auto &n = files.emplace_back(name);
+                name += n.size() + 1;
+            }
+        } else {
+            LPCSTR name = (LPCSTR)((char*)pDropFiles + pDropFiles->pFiles);
+            while (*name) {
+                size_t wlen = MultiByteToWideChar(CP_ACP, 0, name, -1, NULL, 0);
+                if (wlen) {
+                    auto &n = files.emplace_back(wlen);
+                    n.resize(MultiByteToWideChar(CP_ACP, 0, name, -1, n.data(), wlen));
+                }
+                name += strlen(name) + 1;
+            }
+        }
+
+        for (const auto &n : files) {
+            if (!args.empty()) {
+                args.push_back(L' ');
+            }
+            if (n.find(L' ') == n.npos) {
+                args += n;
+            } else {
+                args.push_back(L'"');
+                args += n;
+                if (args.back() == L'\\') {
+                    args.push_back(L'\\');
+                }
+                args.push_back(L'"');
+            }
+        }
+
+        *pdwEffect = DROPEFFECT_NONE;
+
+        SHELLEXECUTEINFOW sei = {
+            sizeof(SHELLEXECUTEINFOW),
+            SEE_MASK_NOASYNC,
+            NULL,
+            NULL,
+            _scriptPath.c_str(),
+            args.c_str(),
+            _scriptDirectory.c_str()
+        };
+        OutputDebugStringW(L"PythonDropTarget::Invoke");
+        OutputDebugStringW(_scriptPath.c_str());
+        OutputDebugStringW(args.c_str());
+        OutputDebugStringW(_scriptDirectory.c_str());
+        ShellExecuteExW(&sei);
+
+        return S_OK;
+    }
+
+    // IPersistFile
+    STDMETHODIMP GetCurFile(LPOLESTR *ppszFileName) {
+        return CoTaskCopyWstr((LPWSTR*)ppszFileName, _scriptPath);
+    }
+
+    STDMETHODIMP IsDirty() {
+        return S_FALSE;
+    }
+
+    STDMETHODIMP Load(LPCOLESTR pszFileName, DWORD dwMode) {
+        if (pszFileName) {
+            _scriptPath = pszFileName;
+            _scriptName = PathFindFileNameW(pszFileName);
+            _scriptDirectory = _scriptPath;
+            _scriptDirectory.resize(_scriptDirectory.size() - _scriptName.size());
+        } else {
+            _scriptPath.clear();
+            _scriptName.clear();
+            _scriptDirectory.clear();
+        }
+        return S_OK;
+    }
+
+    STDMETHODIMP Save(LPCOLESTR pszFileName, BOOL fRemember) {
+        return E_NOTIMPL;
+    }
+
+    STDMETHODIMP SaveCompleted(LPCOLESTR pszFileName) {
+        return E_NOTIMPL;
+    }
+
+    STDMETHODIMP GetClassID(CLSID *pClassID) {
+        *pClassID = __uuidof(PythonDropTarget);
+        return S_OK;
+    }
+
+    // IObjectWithSite
+private:
+    ComPtr<IUnknown> _site;
+
+public:
+    IFACEMETHODIMP GetSite(REFIID riid, void **ppvSite)
+    {
+        if (_site) {
+            return _site->QueryInterface(riid, ppvSite);
+        }
+        *ppvSite = NULL;
+        return E_FAIL;
+    }
+
+    IFACEMETHODIMP SetSite(IUnknown *pSite)
+    {
+        _site = pSite;
+        return S_OK;
+    }
+};
+
+
 CoCreatableClass(IdleCommand);
+CoCreatableClass(PythonDropTarget);
 
 #ifdef PYSHELLEXT_TEST
 
