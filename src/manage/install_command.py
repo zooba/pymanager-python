@@ -6,14 +6,16 @@ from .exceptions import (
     AutomaticInstallDisabledError,
     HashMismatchError,
     FilesInUseError,
+    InvalidPackageFileError,
     NoInstallFoundError,
 )
 from .fsutils import ensure_tree, rmtree, unlink
 from .indexutils import Index
 from .logging import CONSOLE_MAX_WIDTH, LOGGER, ProgressPrinter, VERBOSE
 from .pathutils import Path, PurePath
-from .tagutils import install_matches_any, tag_or_range
+from .tagutils import CompanyTag, install_matches_any, tag_or_range
 from .urlutils import (
+    is_valid_url,
     sanitise_url,
     urlopen as _urlopen,
     urlretrieve as _urlretrieve,
@@ -391,20 +393,36 @@ def print_cli_shortcuts(cmd):
             LOGGER.info("Installed %s to %s", i["display-name"], i["prefix"])
 
 
+def read_bundled_install(package):
+    import zipfile
+    with zipfile.ZipFile(package, "r") as zf:
+        return json.loads(zf.read("__install__.json"))
+
+
 def _same_install(i, j):
     return i["id"] == j["id"] and i["sort-version"] == j["sort-version"]
 
 
 def _find_one(cmd, source, tag, *, installed=None, by_id=False):
+    install = None
     if by_id:
         LOGGER.debug("Searching for Python with ID %s", tag)
+    elif isinstance(tag, Path):
+        LOGGER.verbose("Using package from %s", tag)
+        try:
+            install = read_bundled_install(tag)
+            install["url"] = tag.as_uri()
+            install["source"] = ""
+        except (KeyError, OSError) as ex:
+            raise InvalidPackageFileError(tag) from ex
     elif tag:
         LOGGER.verbose("Searching for Python matching %s", tag)
     else:
         LOGGER.verbose("Searching for default Python version")
 
-    downloader = IndexDownloader(source, Index, {}, DOWNLOAD_CACHE)
-    install = select_package(downloader, tag, cmd.default_platform, by_id=by_id)
+    if not install:
+        downloader = IndexDownloader(source, Index, {}, DOWNLOAD_CACHE)
+        install = select_package(downloader, tag, cmd.default_platform, by_id=by_id)
 
     if by_id:
         return install
@@ -442,7 +460,10 @@ def _find_one(cmd, source, tag, *, installed=None, by_id=False):
 
 
 def _download_one(cmd, source, install, download_dir, *, must_copy=False):
-    package = download_dir / f"{install['id']}-{install['sort-version']}.zip"
+    if "id" in install and "sort-version" in install:
+        package = download_dir / f"{install['id']}-{install['sort-version']}.zip"
+    else:
+        package = download_dir / PurePath(install["url"]).name
     # Preserve nupkg extensions so we can directly reference Nuget packages
     if install["url"].casefold().endswith(".nupkg".casefold()):
         package = package.with_suffix(".nupkg")
@@ -620,7 +641,7 @@ def _install_one(cmd, source, install, *, target=None):
             install["shortcuts"] = shortcuts
 
         install["url"] = sanitise_url(install["url"])
-        if source != cmd.fallback_source:
+        if "source" not in install and source != cmd.fallback_source:
             install["source"] = sanitise_url(source)
 
         LOGGER.debug("Write __install__.json to %s", dest)
@@ -668,6 +689,18 @@ def _fatal_install_error(cmd, ex):
     raise SystemExit(getattr(ex, "winerror", getattr(ex, "errno", 0)) or 1) from ex
 
 
+def _as_local_file(cmd, arg):
+    if is_valid_url(arg):
+        install = {"id": arg, "url": arg}
+        return _download_one(cmd, None, install, cmd.download_dir)
+    try:
+        p = Path(arg)
+        if p.is_absolute() and p.exists():
+            return p
+    except (OSError, ValueError):
+        pass
+
+
 def execute(cmd):
     LOGGER.debug("BEGIN install_command.execute: %r", cmd.args)
 
@@ -702,33 +735,48 @@ def execute(cmd):
 
     download_index = {"versions": []}
 
+    # Either tag, range, or Path, referencing the package to install.
+    to_install = []
+    # cmd.tags will have tags or ranges to filter things we're installing now.
+    cmd.tags = []
+
     if not cmd.by_id:
         for arg in cmd.args:
             if arg.casefold() == "default".casefold():
                 LOGGER.debug("Replacing 'default' with '%s'", cmd.default_install_tag)
-                cmd.tags.append(tag_or_range(cmd.default_install_tag))
+                tag = tag_or_range(cmd.default_install_tag)
+                cmd.tags.append(tag)
+                to_install.append(tag)
+            elif f := _as_local_file(cmd, arg):
+                # Will update cmd.tags later
+                to_install.append(f)
             else:
                 try:
-                    cmd.tags.append(tag_or_range(arg))
+                    tag = tag_or_range(arg)
+                    cmd.tags.append(tag)
+                    to_install.append(tag)
                 except ValueError as ex:
                     LOGGER.warn("%s", ex)
 
-        if not cmd.tags and cmd.automatic:
-            cmd.tags = [tag_or_range(cmd.default_install_tag)]
+        if not to_install and cmd.automatic:
+            tag = tag_or_range(cmd.default_install_tag)
+            cmd.tags.append(tag)
+            to_install.append(tag)
     else:
         if cmd.from_script:
             raise ArgumentError("Cannot use --by-id and --from-script together")
-        cmd.tags = [arg.casefold() for arg in cmd.args]
-        if not cmd.tags:
+        tags = [arg.casefold() for arg in cmd.args]
+        cmd.tags.extend(tags)
+        to_install.extend(tags)
+        if not to_install:
             raise ArgumentError("One or more IDs are required with --by-id")
-
 
     try:
         if cmd.target:
-            if len(cmd.tags) > 1:
+            if len(to_install) > 1:
                 raise ArgumentError("Unable to install multiple versions with --target")
             try:
-                tag = cmd.tags[0]
+                tag = to_install[0]
             except IndexError:
                 if cmd.default_install_tag:
                     LOGGER.debug("No tags provided, installing default tag %s", cmd.default_install_tag)
@@ -769,10 +817,9 @@ def execute(cmd):
                 spec = find_install_from_script(cmd, cmd.from_script)
             except LookupError:
                 spec = None
-            if spec:
-                cmd.tags.append(tag_or_range(spec))
-            else:
-                cmd.tags.append(tag_or_range(cmd.default_install_tag))
+            tag = tag_or_range(spec if spec else cmd.default_install_tag)
+            cmd.tags.append(tag)
+            to_install.append(tag)
 
         installed = list(cmd.get_installs())
 
@@ -784,13 +831,13 @@ def execute(cmd):
             installed = []
 
         try:
-            if not cmd.tags:
+            if not to_install:
                 if cmd.repair:
                     LOGGER.verbose("No tags provided, repairing all installs:")
                     for install in installed:
                         # Only try to redownload from the same source
                         _install_one(cmd, install.get('source'), install)
-                    # Fallthrough is safe - cmd.tags is empty
+                    # Fallthrough is safe - to_install is empty
                 elif cmd.update:
                     LOGGER.verbose("No tags provided, updating all installs:")
                     for install in installed:
@@ -822,7 +869,7 @@ def execute(cmd):
                                 install["company"], install["tag"],
                                 install["display-name"],
                             )
-                    # Fallthrough is safe - cmd.tags is empty
+                    # Fallthrough is safe - to_install is empty
                 else:
                     raise ArgumentError("Specify at least one tag to install, or 'default' for "
                                         "the latest recommended release.")
@@ -834,7 +881,7 @@ def execute(cmd):
                     continue
                 LOGGER.debug("Searching %s", source)
                 try:
-                    for tag in cmd.tags:
+                    for tag in to_install:
                         install = _find_one(cmd, source, tag, installed=installed, by_id=cmd.by_id)
                         if install:
                             installs.append(install)
@@ -867,6 +914,9 @@ def execute(cmd):
             raise
         except NoInstallFoundError as ex:
             raise SystemExit(1) from ex
+        except InvalidPackageFileError as ex:
+            LOGGER.error("%s", ex)
+            return _fatal_install_error(cmd, ex)
         except Exception as ex:
             return _fatal_install_error(cmd, ex)
 

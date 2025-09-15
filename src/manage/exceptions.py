@@ -75,3 +75,9 @@ class AutomaticInstallDisabledError(Exception):
 class FilesInUseError(Exception):
     def __init__(self, files):
         self.files = files
+
+
+class InvalidPackageFileError(Exception):
+    def __init__(self, source):
+        super().__init__(f"File at {source} is not a valid package. "
+                          "See the log file for additional information.")

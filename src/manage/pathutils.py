@@ -70,6 +70,10 @@ class PurePath:
             bits.pop(i - 1)
         return bits
 
+    def is_absolute(self):
+        drive, root, tail = os.path.splitroot(self._p)
+        return drive and root
+
     def __truediv__(self, other):
         other = str(other)
         # Quick hack to hide leading ".\" on paths. We don't fully normalise
