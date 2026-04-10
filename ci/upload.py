@@ -1,3 +1,4 @@
+import hashlib
 import os
 import subprocess
 import sys
@@ -14,6 +15,12 @@ UPLOAD_HOST_KEY = os.getenv("UPLOAD_HOST_KEY", "")
 UPLOAD_KEYFILE = os.getenv("UPLOAD_KEYFILE", "")
 UPLOAD_USER = os.getenv("UPLOAD_USER", "")
 NO_UPLOAD = os.getenv("NO_UPLOAD", "no")[:1].lower() in "yt1"
+RELEASE_API_URL = os.getenv("RELEASE_API_URL", "https://www.python.org/api").rstrip("/")
+RELEASE_API_KEY = os.getenv("RELEASE_API_KEY")
+
+RELEASE_API_HEADERS = {"Content-Type": "application/json; charset=utf-8"}
+if RELEASE_API_KEY:
+    RELEASE_API_HEADERS["Authorization"] = f"ApiKey {RELEASE_API_KEY}"
 
 # Set to 'true' when updating index.json, rather than the app
 UPLOADING_INDEX = os.getenv("UPLOADING_INDEX", "no")[:1].lower() in "yt1"
@@ -126,6 +133,14 @@ def url2path(url):
     return UPLOAD_PATH_PREFIX + url[len(UPLOAD_URL_PREFIX) :]
 
 
+def sha256_for(file):
+    h = hashlib.sha256()
+    with open(file, "rb") as f:
+        while b := f.read(1024 * 1024):
+            h.update(b)
+    return h.hexdigest().upper()
+
+
 def appinstaller_uri_matches(file, name):
     NS = {}
     with open(file, "r", encoding="utf-8") as f:
@@ -186,6 +201,101 @@ def validate_appinstaller(file, uploads):
     print()
 
 
+_get_release_id_cache = {}
+def get_release_id(**params):
+    if not RELEASE_API_URL:
+        raise RuntimeError("Cannot query object when RELEASE_API_URL is not set")
+    uri = f"{RELEASE_API_URL}/v1/downloads/release/"
+    uri += "?" + "&".join(f"{k}={v}" for k, v in params.items())
+    try:
+        return _get_release_id_cache[uri]
+    except KeyError:
+        pass
+    req = Request(uri, method="GET", headers=RELEASE_API_HEADERS)
+    with urlopen(req) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"no release for {params!r}: Status {resp.status}")
+        obj = json.loads(resp.read())["objects"][0]
+    _get_release_id_cache[url] = obj["resource_url"]
+    return obj["resource_uri"]
+
+
+def calculate_release_file(file, url, upload_path):
+    if not file:
+        return
+    if not url:
+        print("Skipping", file, "as no URL was provided")
+        return
+    m = re.match(r".*?(\d+(?:\.\d+)*(?:(?:a|b|rc)?\d+))$", file.stem)
+    if not m:
+        print("Skipping", file, "as no version was found in filename")
+        return
+    slug = m.group(1).replace(".", "")
+    rel_pk = get_release_id(slug=f"pymanager-{slug}")
+    if not rel_pk:
+        print("Skipping", slug, "as no release was found")
+        return
+    data = {
+        "os": "/api/v1/downloads/os/windows/",
+        "is_source": False,
+        "url": url,
+        "release": rel_pk,
+        "sha256_sum": sha256sum_for(filename),
+        "filesize": file.stat().st_size,
+        "download_button": False,
+    }
+    if file.match("*.msix"):
+        return {
+            **data,
+            "name": "Installer (MSIX)",
+            "slug": f"pymanager-{slug}-msix",
+            "description": f"Bundles Python {BUNDLED_RUNTIME_VERSION}",
+            "download_button": True,
+        }
+    if file.match("*.msi"):
+        return {
+            **data,
+            "name": "MSI package",
+            "slug": f"pymanager-{slug}-msi",
+            "description": "See documentation before use",
+        }
+
+
+def publish_release_files(file_data):
+    if not file_data:
+        return
+    print("Publishing:")
+    print(json.dumps(file_data, indent=2))
+    if NO_UPLOAD:
+        print("Skipping release files due to NO_UPLOAD")
+        return
+    if not RELEASE_API_URL:
+        raise RuntimeError("Cannot publish object when RELEASE_API_URL is not set")
+    if not RELEASE_API_KEY:
+        raise RuntimeError("Cannot publish object when RELEASE_API_KEY is not set")
+    rel_pk = int(file_data["release"].rstrip("/").rpartition("/")[2]
+    print("Deleting files from release", rel)
+    u = f"{RELEASE_API_URL}/v1/downloads/release_file/?release={rel}"
+    req = Request(u, method="DELETE", headers=RELEASE_API_HEADERS)
+    with urlopen(req) as r:
+        if 200 <= r.status < 300:
+            print(f"Deleted successfully (status={r.status}).")
+        else:
+            print(f"Failed to delete (status={r.status}). Attempting to publish anyway.")
+
+    print("Publishing release file")
+    u = f"{RELEASE_API_URL}/v1/downloads/release_file/"
+    data = json.dumps(file_data).encode("utf-8")
+    req = Request(u, method="POST", data=data, headers=RELEASE_API_HEADERS)
+    with urlopen(req) as r:
+        if 200 <= r.status < 300:
+            print(f"Created successfully (status={r.status}).")
+        else:
+            print(f"Failed to create (status={r.status}).")
+    print("Publishing complete")
+
+
+
 def purge(url):
     if not UPLOAD_HOST or NO_UPLOAD:
         print("Skipping purge of", url, "because UPLOAD_HOST is missing")
@@ -242,3 +352,15 @@ for f, u, p in UPLOADS:
 
 # Purge the upload directory so that the FTP browser is up to date
 purge(UPLOAD_URL)
+
+
+if RELEASE_API_URL:
+    files = []
+    for f, u, p in UPLOADS:
+        fd = calculate_release_file(f, u, p)
+        if fd:
+            files.append(fd)
+
+    print("Releasing", len(files), "files")
+    for fd in files:
+        publish_release_file(fd)

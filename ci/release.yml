@@ -357,13 +357,13 @@ stages:
         $hashes = $files  | `
             Sort-Object Name | `
             Format-Table Name, @{
-              Label="MD5";
-              Expression={(Get-FileHash $_ -Algorithm MD5).Hash}
+              Label="SHA256";
+              Expression={(Get-FileHash $_ -Algorithm SHA256).Hash}
             }, Length -AutoSize | `
             Out-String -Width 4096
         $hashes
       workingDirectory: $(DIST_DIR)
-      displayName: 'Generate hashes (MD5)'
+      displayName: 'Generate hashes (SHA256)'
 
     - ${{ if eq(parameters.Publish, 'true') }}:
       - ${{ if eq(parameters.Sign, 'true') }}:
@@ -404,6 +404,8 @@ stages:
           UPLOAD_HOST_KEY: $(PyDotOrgHostKey)
           UPLOAD_USER: $(PyDotOrgUsername)
           UPLOAD_KEYFILE: $(sshkey.secureFilePath)
+          RELEASE_API_KEY: $(PyDotOrgApiKey)
+          BUNDLED_RUNTIME_VERSION: 3.14.3
           ${{ if ne(parameters.Sign, 'true') }}:
             NO_UPLOAD: 1
 
