@@ -161,6 +161,15 @@ def _bits_urlretrieve(request):
         if (ex.winerror or 0) & 0xFFFFFFFF == 0x80200010:
             raise NoInternetError() from ex
         raise
+    except KeyboardInterrupt:
+        # Ideally we'd prompt here, since the download is restartable, but we've
+        # got no config/command object. So it can wait for a refactor.
+        LOGGER.debug("Cancelling download")
+        if job:
+            bits_cancel(bits, job)
+        if jobfile.is_file():
+            unlink(jobfile)
+        raise
     unlink(jobfile)
 
 
